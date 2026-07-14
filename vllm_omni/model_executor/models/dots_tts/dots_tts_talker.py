@@ -48,6 +48,7 @@ Reference: vllm_omni/model_executor/models/ming_flash_omni/ming_flash_omni_talke
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import os
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -113,6 +114,7 @@ _DIT_NUM_STEPS = int(
     os.environ.get("DOTS_TTS_DIT_NUM_STEPS", "10")
 )  # env-gated; upstream default 10 for fixed-step Euler
 _DIT_GUIDANCE_SCALE = 1.2  # upstream default guidance_scale for soar
+_DIT_NOISE_SEED = 20260601  # base seed for per-request FM noise (voxcpm2 parity)
 _PATCH_ENCODER_OUT_DS_RATE = 2  # patch_size / in_ds_rate = 4 / 2 (VAESemanticEncoder hardcodes in_ds_rate=2)
 
 
@@ -155,6 +157,7 @@ class _IOHelper:
 # Per-request state container for AR-loop continuity (see notes §3.3 / §0.5).
 # Step 7a opens with just the next-step embed slot — 7b/7e add fields for
 # stop logits, pending audio chunks, prefill masks, etc.
+# 逻辑 pipeline modelrunner（中的东西） 性能优化
 @dataclass
 class _RequestState:
     request_id: str
@@ -170,6 +173,11 @@ class _RequestState:
     precomputed_stop_logits: torch.Tensor | None = None
     is_stopping: bool = False
     prefill_completed: bool = False
+    # Per-request FM noise counter: draw #n of this request hashes to a
+    # deterministic Generator seed (see _run_dit_n_step_euler), so outputs
+    # are reproducible run-to-run and concurrent requests cannot perturb
+    # each other's noise streams (voxcpm2 _fill_deterministic_cfm_noise).
+    noise_step: int = 0
     # Step 7e-r1: per-request FM static workspace (lazy-allocated by
     # _initialize_request_fm_state on first _finish_decode call).  Sized for
     # _MAX_AUDIO_PATCHES × (_HIDDEN_PATCH_SIZE + _LATENT_PATCH_SIZE) = 1024 × 5
@@ -563,6 +571,7 @@ class DotsTTSForConditionalGeneration(nn.Module):
             state.precomputed_stop_logits = None
             state.is_stopping = False
             state.prefill_completed = False
+            state.noise_step = 0
             # 7e-r2: reset AR-loop state on every prefill.
             state.patch_encoder_state = None
             embeds = self.model.embed_tokens(input_ids)
@@ -703,6 +712,12 @@ class DotsTTSForConditionalGeneration(nn.Module):
                     prob_stop=None,
                 )
             state.prefill_completed = True
+            # Keep len(_results_queue) == bsz: compute_logits pairs queue
+            # entries with batch rows positionally, so every request in the
+            # batch must push exactly one entry per step (voxcpm2_talker.py
+            # prefill placeholder pattern).  None → forced continue via the
+            # stop_logits-is-None branch in compute_logits.
+            self._results_queue.append((req_id, None))
             return
 
         # 6. AudioVAE decode raw latent → wav chunk.
@@ -954,9 +969,31 @@ class DotsTTSForConditionalGeneration(nn.Module):
         g_cond_batched = torch.cat([g_cond, torch.zeros_like(g_cond)], dim=0)
 
         latent_start = total_len - _LATENT_PATCH_SIZE
-        z = torch.randn((1, _LATENT_PATCH_SIZE, _LATENT_DIM), device=device, dtype=dtype)
+        # fp32 ODE integration (same fix as Ming's CFM sampler, PR #4341):
+        # bf16's 7-bit mantissa loses the small per-step increments in the
+        # z += v*dt accumulation (hidden-state cos drift past step ~7,
+        # notes §17) and quantizes the linspace timesteps.  Integration
+        # state stays fp32; DiT matmuls still run bf16 under the autocast
+        # block below, and the result is cast back to the sequence dtype
+        # on return.
+        # Deterministic per-request noise (voxcpm2 _fill_deterministic_cfm_
+        # noise pattern): hash seed:request_key:draw# into a private
+        # Generator instead of the global CUDA RNG, so outputs reproduce
+        # run-to-run and concurrent requests cannot perturb each other's
+        # noise streams.  request_key strips the engine's per-run "<idx>_"
+        # uuid suffix so replay across runs keys on the stable batch index.
+        request_key = state.request_id.split("_", 1)[0]
+        if not request_key.isdigit():
+            request_key = state.request_id
+        noise_key = f"{_DIT_NOISE_SEED}:{request_key}:{state.noise_step}".encode()
+        digest = hashlib.blake2b(noise_key, digest_size=8).digest()
+        gen = torch.Generator(device=device)
+        gen.manual_seed(int.from_bytes(digest, "little") & 0x7FFF_FFFF_FFFF_FFFF)
+        z = torch.empty((1, _LATENT_PATCH_SIZE, _LATENT_DIM), device=device, dtype=torch.float32)
+        z.normal_(generator=gen)
+        state.noise_step += 1
         dt = 1.0 / num_steps
-        times = torch.linspace(0.0, 1.0, num_steps + 1, device=device, dtype=dtype)
+        times = torch.linspace(0.0, 1.0, num_steps + 1, device=device, dtype=torch.float32)
 
         # Match upstream's autocast wrapper (model.py:280).  DiT's
         # TimestepEmbedder internally forces fp32 (`.float()` on freqs);
@@ -984,11 +1021,14 @@ class DotsTTSForConditionalGeneration(nn.Module):
                     pos_ids=pos_ids,
                     g_cond=g_cond_batched,
                 )
-                vt = vt[:, latent_start:]
+                # Upcast DiT output before CFG blend + Euler update so the
+                # accumulation arithmetic stays fp32 (autocast only affects
+                # matmuls; these pointwise ops keep their input dtype).
+                vt = vt[:, latent_start:].float()
                 vt_c, vt_u = vt[0:1], vt[1:2]
                 velocity = vt_c + guidance_scale * (vt_c - vt_u)
                 z = z + velocity * dt
-        return z
+        return z.to(dtype)
 
     def _run_patch_encoder_loopback(
         self,
