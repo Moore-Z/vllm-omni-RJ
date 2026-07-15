@@ -67,33 +67,31 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 logger = init_logger(__name__)
 
 
-# Vocoder hyperparameters from rednote-hilab/dots.tts-soar config.json
-# (the ``vocoder`` block).  dots.tts-mf ships identical values.  A future step
-# will replace this hard-coded factory with a parse off the real HF config.
-def _build_soar_audio_vae_config() -> AudioVAEConfig:
-    return AudioVAEConfig(
-        sample_rate=48000,
-        upsample_rates=[10, 6, 4, 2, 2, 2],
-        upsample_kernel_sizes=[20, 12, 8, 4, 4, 4],
-        upsample_initial_channel=1536,
-        resblock="1",
-        resblock_kernel_sizes=[3, 7, 11],
-        resblock_dilation_sizes=[[1, 3, 5], [1, 3, 5], [1, 3, 5]],
-        downsample_rates=[2, 2, 2, 4, 6, 10],
-        downsample_channels=[12, 24, 48, 96, 192, 384, 768],
-        activation="snakebeta",
-        snake_logscale=True,
-        latent_dim=128,
-        causal=True,
-        mi_num_layers=4,
-        causal_encoder=True,
-        use_bias_at_final=False,
-        use_tanh_at_final=False,
-    )
+def _require_config_block(hf_config: Any, name: str) -> dict[str, Any]:
+    """Fetch a sub-config dict (``vocoder`` / ``DiT`` / ``PatchEncoder``)
+    from the checkpoint's config.json, failing loudly when absent —
+    silently falling back to another checkpoint's values would produce
+    garbage audio, not an error."""
+    block = getattr(hf_config, name, None)
+    if not isinstance(block, dict) or not block:
+        raise ValueError(
+            f"dots.tts checkpoint config.json has no '{name}' block — cannot "
+            "build the audio side path.  Expected the upstream dots.tts config "
+            "layout (e.g. rednote-hilab/dots.tts-soar)."
+        )
+    return block
 
 
-# Architecture constants (dots.tts-soar; matches _build_soar_*_config defaults).
-# A later step will source these from real HF config (latent_stats.pt + DiT block).
+def _build_audio_vae_config(hf_config: Any) -> AudioVAEConfig:
+    # AudioVAEConfig declares exactly the checkpoint's 17 ``vocoder`` keys,
+    # so an unknown / missing key raises TypeError instead of guessing.
+    return AudioVAEConfig(**_require_config_block(hf_config, "vocoder"))
+
+
+# Architecture constants used by the per-request FM workspace math.  All
+# released dots.tts checkpoints (soar / base / mf) share these values;
+# _validate_architecture_constants refuses a checkpoint that disagrees
+# instead of silently generating garbage.
 _FM_HIDDEN = 1024  # DiT.hidden_size  (also LLM↔DiT projection target)
 _LATENT_DIM = 128  # AudioVAE.latent_dim
 _LATENT_PATCH_SIZE = 4  # config.patch_size — DiT samples 4 latent frames / audio patch
@@ -222,8 +220,10 @@ class _DiTConfig:
         return dataclasses.asdict(self)
 
 
-def _build_soar_dit_config() -> _DiTConfig:
-    return _DiTConfig()  # all defaults already match dots.tts-soar
+def _build_dit_config(hf_config: Any) -> _DiTConfig:
+    # _DiTConfig declares exactly the checkpoint's 13 ``DiT`` keys, so an
+    # unknown key raises TypeError instead of being silently dropped.
+    return _DiTConfig(**_require_config_block(hf_config, "DiT"))
 
 
 # Patch encoder hyperparameters from rednote-hilab/dots.tts-soar config.json
@@ -261,8 +261,35 @@ class _PatchEncoderConfig:
     PatchEncoder: _PatchEncoderInner = dataclasses.field(default_factory=_PatchEncoderInner)
 
 
-def _build_soar_patch_encoder_config() -> _PatchEncoderConfig:
-    return _PatchEncoderConfig()  # all defaults already match dots.tts-soar
+def _build_patch_encoder_config(hf_config: Any) -> _PatchEncoderConfig:
+    block = _require_config_block(hf_config, "PatchEncoder")
+    # SuperviseEncoder reads only the six declared fields; upstream's
+    # pydantic config swallows the other checkpoint keys, so filtering
+    # here matches upstream behaviour exactly.
+    inner_fields = {f.name for f in dataclasses.fields(_PatchEncoderInner)}
+    inner = _PatchEncoderInner(**{k: v for k, v in block.items() if k in inner_fields})
+    return _PatchEncoderConfig(
+        patch_size=int(hf_config.patch_size),
+        PatchEncoder=inner,
+    )
+
+
+def _validate_architecture_constants(hf_config: Any, dit_config: _DiTConfig) -> None:
+    """The FM workspace helpers size buffers off module-level constants;
+    a checkpoint that disagrees would corrupt the DiT conditioning, so
+    refuse it up front (making these fully config-driven is deferred
+    until a released checkpoint actually differs)."""
+    checks = [
+        ("latent_dim", getattr(hf_config, "latent_dim", None), _LATENT_DIM),
+        ("patch_size", getattr(hf_config, "patch_size", None), _LATENT_PATCH_SIZE),
+        ("DiT.hidden_size", dit_config.hidden_size, _FM_HIDDEN),
+    ]
+    mismatches = [f"{name}={got!r} (expected {want})" for name, got, want in checks if got != want]
+    if mismatches:
+        raise ValueError(
+            "dots.tts checkpoint config disagrees with this integration's "
+            "architecture constants: " + ", ".join(mismatches)
+        )
 
 
 class DotsTTSForConditionalGeneration(nn.Module):
@@ -289,7 +316,17 @@ class DotsTTSForConditionalGeneration(nn.Module):
         )
         self.make_empty_intermediate_tensors = self.model.make_empty_intermediate_tensors
 
-        self._audio_vae = AudioVAE(_build_soar_audio_vae_config())
+        # Side-path module hyperparameters come off the checkpoint's
+        # config.json blocks (fail loudly if a block is absent); the FM
+        # workspace constants are cross-checked against the same config.
+        dit_config = _build_dit_config(self.config)
+        _validate_architecture_constants(self.config, dit_config)
+        llm_hidden = self.config.hidden_size
+        fm_hidden = dit_config.hidden_size
+        latent_dim = int(self.config.latent_dim)
+        xvec_dim = int(getattr(self.config, "campplus_embedding_size", 512))
+
+        self._audio_vae = AudioVAE(_build_audio_vae_config(self.config))
         # Upstream serializes vocoder.safetensors with weight_norm folded into
         # plain `weight` on the decoder (encoder kept weight_norm — it's not in
         # the synthesis hot path).  Match that layout before load_weights runs,
@@ -303,59 +340,55 @@ class DotsTTSForConditionalGeneration(nn.Module):
         # stream_step (input .float() vs bf16 weights).
 
         # DiT flow-matching head.  Dimensions per upstream core.py:101-104:
-        #   in_dim  = config.DiT.hidden_size = 1024  (DiT internal space)
-        #   out_dim = config.latent_dim      = 128   (AudioVAE input space)
+        #   in_dim  = config.DiT.hidden_size  (DiT internal space)
+        #   out_dim = config.latent_dim       (AudioVAE input space)
         # mode is "flow_matching" for soar/base; "meanflow" only for the mf
         # checkpoint (handled by a separate factory in a later step).
         self._head = DiT(
-            in_dim=1024,
-            out_dim=128,
-            transformer_config=_build_soar_dit_config(),
+            in_dim=fm_hidden,
+            out_dim=latent_dim,
+            transformer_config=dit_config,
             mode="flow_matching",
         )
 
         # Patch encoder: closes the AR loop by mapping each DiT-emitted audio
         # latent patch back into the LLM hidden space, so Qwen2 "hears" what it
         # has already generated.  Upstream core.py:75 calls this with
-        # in_dim=latent_dim (= AudioVAE's 128 for soar) and
-        # out_dim=llm.config.hidden_size (= Qwen2.5-1.5B's 1536).
+        # in_dim=latent_dim and out_dim=llm.config.hidden_size.
         self._patch_encoder = VAESemanticEncoder(
-            in_dim=128,
-            out_dim=1536,
-            config=_build_soar_patch_encoder_config(),
+            in_dim=latent_dim,
+            out_dim=llm_hidden,
+            config=_build_patch_encoder_config(self.config),
         )
 
-        # Five thin projectors (upstream core.py:82-113).  Dimensions (soar):
-        #   llm_hidden = 1536  (Qwen2.5-1.5B)
-        #   fm_hidden  = 1024  (DiT.hidden_size)
-        #   latent_dim = 128   (AudioVAE latent_dim)
-        #   xvec_dim   = 512   (campplus_embedding_size, CAM++ output)
+        # Five thin projectors (upstream core.py:82-113).  Soar dimensions:
+        # llm_hidden=1536, fm_hidden=1024, latent_dim=128, xvec_dim=512.
         # These are kept as direct attributes (no vendor file) — they are flat
         # nn.Linear / nn.Sequential, and live at the top of the checkpoint
         # namespace under their own short prefixes (see load_weights).
-        self._hidden_proj = nn.Linear(1536, 1024)
-        self._latent_proj = nn.Linear(128, 1024)
-        self._coordinate_proj = nn.Linear(128, 1024)
+        self._hidden_proj = nn.Linear(llm_hidden, fm_hidden)
+        self._latent_proj = nn.Linear(latent_dim, fm_hidden)
+        self._coordinate_proj = nn.Linear(latent_dim, fm_hidden)
         self._xvec_proj = nn.Sequential(
-            nn.Linear(512, 1024),
-            nn.LayerNorm(1024),
+            nn.Linear(xvec_dim, fm_hidden),
+            nn.LayerNorm(fm_hidden),
         )
         # eos_proj is the stop predictor — feeds LLM hidden through a 2-layer
         # MLP and produces a 2-way logit (continue / stop).
         self._eos_proj = nn.Sequential(
-            nn.Linear(1536, 1536),
+            nn.Linear(llm_hidden, llm_hidden),
             nn.SiLU(),
-            nn.Linear(1536, 2),
+            nn.Linear(llm_hidden, 2),
         )
 
-        # CAM++ speaker encoder (3D-Speaker), produces 512-dim x-vector from
-        # reference audio for voice cloning.  sample_rate=48000 matches
-        # AudioVAE's input space; the wrapper resamples to 16k internally for
+        # CAM++ speaker encoder (3D-Speaker), produces the x-vector from
+        # reference audio for voice cloning.  sample_rate matches AudioVAE's
+        # input space (48 kHz); the wrapper resamples to 16k internally for
         # CAM++.  Weights are frozen (upstream does `requires_grad = False`).
         self._speaker_encoder = SpeakerXVectorFeatures(
-            sample_rate=48000,
-            campplus_embedding_size=512,
-            max_audio_seconds=10.0,
+            sample_rate=self._audio_vae.sample_rate,
+            campplus_embedding_size=xvec_dim,
+            max_audio_seconds=float(getattr(self.config, "xvec_max_audio_seconds", 10.0)),
         )
 
         # Pin AudioVAE + speaker encoder to fp32 (mirror upstream

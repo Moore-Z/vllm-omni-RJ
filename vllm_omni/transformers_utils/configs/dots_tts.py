@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""HF config for dots.tts — step 5d.
+"""HF config for dots.tts.
 
 dots.tts splits its config across two files in the HF checkpoint:
   * ``config.json``      — top-level dots.tts fields (latent_dim / patch_size
@@ -8,16 +8,18 @@ dots.tts splits its config across two files in the HF checkpoint:
   * ``llm_config.json``  — full Qwen2 LM config (vocab_size / hidden_size /
                             num_hidden_layers / rope_theta / etc.).
 
-``AutoConfig.from_pretrained`` only consumes ``config.json`` automatically, so
-this class hoists the Qwen2 fields to top-level attributes with defaults
-matching the dots.tts-soar checkpoint.  vLLM's ``Qwen2Model.__init__`` then
-reads ``config.hidden_size`` / ``config.vocab_size`` / etc. directly through
+``AutoConfig.from_pretrained`` only consumes ``config.json``: its dots.tts
+sub-blocks (``vocoder`` / ``DiT`` / ``PatchEncoder``) arrive through
+``**kwargs`` and land as attributes, which the talker's config factories
+consume directly.  The Qwen2 LM fields live in ``llm_config.json``, which
+AutoConfig never reads — this class hoists them to top-level attributes
+with defaults matching the released checkpoints (soar / base / mf all ship
+the same Qwen2.5-1.5B backbone).  vLLM's ``Qwen2Model.__init__`` then reads
+``config.hidden_size`` / ``config.vocab_size`` / etc. through
 ``get_text_config()``, the same pattern voxcpm2 follows.
 
-Future work: read ``llm_config.json`` properly during ``from_pretrained`` so
-users can swap to other dots.tts variants (mf / base) without editing this
-file — for now soar values are hardcoded just like the AudioVAE / DiT /
-patch_encoder factories in the talker.
+Future work: read ``llm_config.json`` during ``from_pretrained`` so a
+checkpoint with a different LM shape works without editing this file.
 
 Upstream reference:
   https://huggingface.co/rednote-hilab/dots.tts-soar/blob/main/llm_config.json
@@ -38,15 +40,7 @@ class DotsTTSConfig(PretrainedConfig):
     def __init__(
         self,
         # -- top-level dots.tts params --
-        architecture: str = "dots_tts",
         lm_config: dict | None = None,
-        dit_config: dict | None = None,
-        audio_vae_config: dict | None = None,
-        bigvgan_config: dict | None = None,
-        speaker_encoder_config: dict | None = None,
-        sample_rate: int = 48000,
-        dtype: str = "bfloat16",
-        device: str = "cuda",
         # -- LM defaults (overridden by lm_config dict if present) --
         # All values match dots.tts-soar's llm_config.json.
         vocab_size: int = 151672,
@@ -70,18 +64,11 @@ class DotsTTSConfig(PretrainedConfig):
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )
-        self.architecture = architecture
-
-        # -- dots.tts-specific fields (kept as dicts for now; talker's
-        # hardcoded factories already cover the soar values) --
+        # The dots.tts sub-blocks (vocoder / DiT / PatchEncoder / latent_dim
+        # / patch_size / ...) arrive via **kwargs and are stored as
+        # attributes by PretrainedConfig; the talker's config factories
+        # read them from there.
         self.lm_config = lm_config or {}
-        self.dit_config = dit_config or {}
-        self.audio_vae_config = audio_vae_config or {}
-        self.bigvgan_config = bigvgan_config or {}
-        self.speaker_encoder_config = speaker_encoder_config or {}
-        self.sample_rate = sample_rate
-        self.dtype = dtype
-        self.device = device
 
         # -- Hoist LM parameters to top-level for vLLM's Qwen2Model --
         lm = self.lm_config
