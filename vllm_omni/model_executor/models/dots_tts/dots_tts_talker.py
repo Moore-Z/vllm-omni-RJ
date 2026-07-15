@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""dots.tts talker — step 7e-r3c.
+"""dots.tts talker — review M2 (streaming vocoder).
 
 Wired so far:
   * Qwen2.5-1.5B base LM (vLLM-native) + real weights via
@@ -35,6 +35,12 @@ Wired so far:
     0.8 (upstream eos_threshold default) flips state.is_stopping.
     compute_logits prefill_completed hard-stop fallback removed — stop
     is now fully driven by real eos_proj.
+  * Review M2: AudioVAE streaming decode — per-request BigVGANStreamState
+    (LSTM hidden + sliding latent window) replaces per-patch isolated
+    inference_from_latents, so every patch gets real left conv context.
+    Prefill's patch #0 now reaches the vocoder too (upstream zero-shot
+    emits every DiT patch); stop path drains the 2-frame lookahead tail
+    via stream_flush.
 
 Still stubbed for later steps: end-to-end forward chain (base LM → DiT →
 patch_encoder → AudioVAE → wav), runtime config, CUDA Graph caches,
@@ -195,6 +201,11 @@ class _RequestState:
     # patch_encoder's streaming decode (mirrors upstream state.patch_encoder_state).
     # Lazy-allocated by _run_patch_encoder_loopback on first audio step.
     patch_encoder_state: Any | None = None
+    # Review M2: streaming vocoder state (BigVGANStreamState — LSTM hidden
+    # + decoder sliding latent window).  Gives each patch real left conv
+    # context; output lags input by decoder.stream_lookahead (2 frames =
+    # 3840 samples).  Lazy-allocated by _run_vocoder_stream_step.
+    vocoder_stream_state: Any | None = None
 
 
 # DiT transformer hyperparameters from rednote-hilab/dots.tts-soar config.json
@@ -306,7 +317,7 @@ class DotsTTSForConditionalGeneration(nn.Module):
         # extractor in fp32 because their kernels (conv1d / fbank) need
         # higher precision.  Without this _audio_vae would inherit talker's
         # bf16 dtype via vLLM's auto-cast and dtype-mismatch under
-        # inference_from_latents (input .float() vs bf16 weights).
+        # stream_step (input .float() vs bf16 weights).
 
         # DiT flow-matching head.  Dimensions per upstream core.py:101-104:
         #   in_dim  = config.DiT.hidden_size = 1024  (DiT internal space)
@@ -367,8 +378,8 @@ class DotsTTSForConditionalGeneration(nn.Module):
         # Pin AudioVAE + speaker encoder to fp32 (mirror upstream
         # runtime.py:81 where only `model.core` is cast to bf16).  vLLM's
         # auto-cast would otherwise lower these to bf16, breaking
-        # inference_from_latents (input .float() vs bf16 weights) and the
-        # fbank pipeline.
+        # stream_step (input .float() vs bf16 weights) and the fbank
+        # pipeline.
         self._audio_vae.float()
         self._speaker_encoder.float()
 
@@ -574,6 +585,7 @@ class DotsTTSForConditionalGeneration(nn.Module):
             state.noise_step = 0
             # 7e-r2: reset AR-loop state on every prefill.
             state.patch_encoder_state = None
+            state.vocoder_stream_state = None
             embeds = self.model.embed_tokens(input_ids)
         else:
             curr = state.curr_embed_for_next
@@ -635,10 +647,12 @@ class DotsTTSForConditionalGeneration(nn.Module):
           3. _latent_proj(audio_patch) → fm_sequence (+4 positions, normalized)
           4. io_helper.denormalize(audio_patch) → audio_patch_raw
           5. patch_encoder(audio_patch_raw) → next-step embed [1, 1536]
-          6. (decode only) AudioVAE.inference_from_latents(audio_patch_raw)
-             → wav chunk [7680] pushed to _audio_queue
+          6. AudioVAE stream_step(audio_patch_raw) → wav chunk pushed to
+             _audio_queue (prefill's patch #0 included; output lags 2
+             frames behind input)
           7. (decode only) eos_proj(last_hidden) → stop_logits pushed to
-             _results_queue; threshold > 0.8 flips state.is_stopping.
+             _results_queue; threshold > 0.8 flips state.is_stopping and
+             stream_flush drains the decoder's lookahead tail.
 
         Verify covers prefill + N=10 decode (stop prob distribution + a
         compute_logits drain) in /tmp/test_finish_decode_7e_r3c.py.
@@ -697,7 +711,14 @@ class DotsTTSForConditionalGeneration(nn.Module):
         next_embeds = self._run_patch_encoder_loopback(state, audio_patch_raw)
         state.curr_embed_for_next = next_embeds.squeeze(0).detach()
 
-        # 6-7 (TBD 7e-r3b/c): VAE decode, real eos_proj → real wav + stop signal.
+        # 6. Streaming AudioVAE decode → wav chunk.  Runs on prefill too:
+        #    upstream zero-shot emits every DiT patch including the first
+        #    (_generate_latents_stream drops one patch only under prompt
+        #    prefill / voice clone), and our prefill patch #0 corresponds
+        #    to upstream's first decode-loop patch.
+        wav = self._run_vocoder_stream_step(state, audio_patch_raw)
+        if wav.size(-1) > 0:
+            self._audio_queue.append((req_id, wav.reshape(-1)))
 
         if is_prefill:
             if self._beta_trace:
@@ -708,7 +729,7 @@ class DotsTTSForConditionalGeneration(nn.Module):
                     audio_patch=audio_patch,
                     audio_patch_raw=audio_patch_raw,
                     next_embeds=next_embeds,
-                    wav=None,
+                    wav=wav if wav.size(-1) > 0 else None,
                     prob_stop=None,
                 )
             state.prefill_completed = True
@@ -719,17 +740,6 @@ class DotsTTSForConditionalGeneration(nn.Module):
             # stop_logits-is-None branch in compute_logits.
             self._results_queue.append((req_id, None))
             return
-
-        # 6. AudioVAE decode raw latent → wav chunk.
-        #    inference_from_latents(do_sample=False) expects [B, latent_dim,
-        #    T]; audio_patch_raw is [1, T=4, D=128] from DiT, so transpose
-        #    to [1, 128, 4].  Output: [1, 1, 4*hop_size] = [1, 1, 7680]
-        #    (hop_size = prod(upsample_rates) = 1920).
-        wav = self._audio_vae.inference_from_latents(
-            audio_patch_raw.transpose(1, 2).float(),
-            do_sample=False,
-        )
-        self._audio_queue.append((req_id, wav.reshape(-1)))
 
         # 7. eos_proj → stop probability.  Mirrors upstream
         #    model.py:1681 — softmax([continue, stop]) on detached LLM
@@ -742,6 +752,15 @@ class DotsTTSForConditionalGeneration(nn.Module):
         state.precomputed_stop_logits = stop_logits
         if eos_logits[0, -1, 1].item() > 0.8:
             state.is_stopping = True
+            # Upstream flushes after its decode loop (model.py:1898); our
+            # request ends when vLLM sees this step's stop token, so drain
+            # the decoder's 2-frame lookahead tail in the same step.
+            # Requests cut by max_tokens/abort never reach this path and
+            # lose the 40 ms tail — no engine hook fires late enough to
+            # flush after the final step.
+            tail = self._audio_vae.stream_flush(state.vocoder_stream_state)
+            if tail.size(-1) > 0:
+                self._audio_queue.append((req_id, tail.reshape(-1)))
         self._results_queue.append((req_id, stop_logits))
 
         if self._beta_trace:
@@ -752,7 +771,7 @@ class DotsTTSForConditionalGeneration(nn.Module):
                 audio_patch=audio_patch,
                 audio_patch_raw=audio_patch_raw,
                 next_embeds=next_embeds,
-                wav=wav,
+                wav=wav if wav.size(-1) > 0 else None,
                 prob_stop=eos_logits[0, -1, 1].item(),
             )
 
@@ -1071,6 +1090,37 @@ class DotsTTSForConditionalGeneration(nn.Module):
         pe_state.conv_tail.copy_(conv_tail)
         pe_state.seq_len += _PATCH_ENCODER_OUT_DS_RATE
         return llm_embedding
+
+    def _run_vocoder_stream_step(
+        self,
+        state: _RequestState,
+        audio_patch_raw: torch.Tensor,
+    ) -> torch.Tensor:
+        """Streaming AudioVAE decode of one latent patch (review M2).
+
+        Mirrors upstream generate_audio_stream (model.py:1881-1900): a
+        per-request BigVGANStreamState carries the decoder's LSTM hidden
+        and sliding latent window across steps, so each patch is decoded
+        with real left context instead of inference_from_latents'
+        zero-padded isolated boundary.  Output lags input by
+        decoder.stream_lookahead (2 frames): the first call emits 2 frames
+        (3840 samples), steady state 4 (7680); the stop path in
+        _finish_decode drains the tail via stream_flush.
+
+        audio_patch_raw: [1, T=4, D=128] denormalized latents.
+        Returns wav chunk [1, 1, n_samples] (n_samples may be 0).
+        """
+        if state.vocoder_stream_state is None:
+            state.vocoder_stream_state = self._audio_vae.init_stream_state(
+                batch_size=1,
+                chunk_size=_LATENT_PATCH_SIZE,
+            )
+        # stream_step expects [B, latent_dim, T]; the vocoder is pinned
+        # fp32 (__init__), so cast the (possibly bf16) latents up.
+        return self._audio_vae.stream_step(
+            audio_patch_raw.transpose(1, 2).float(),
+            state.vocoder_stream_state,
+        )
 
     def make_omni_output(
         self,
