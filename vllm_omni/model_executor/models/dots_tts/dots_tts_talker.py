@@ -1,54 +1,37 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""dots.tts talker — review M2 (streaming vocoder).
+"""dots.tts talker — vLLM-native AR base LM + audio side path.
 
-Wired so far:
-  * Qwen2.5-1.5B base LM (vLLM-native) + real weights via
-    ``model.safetensors``'s ``llm.model.*`` namespace.  Config shape now
-    comes from ``DotsTTSConfig`` whose LM fields are hoisted to top-level
-    attributes matching dots.tts-soar's llm_config.json.
-  * AudioVAE side module + real weights via ``vocoder.safetensors``.
-  * DiT flow-matching head + real weights via ``velocity_field_predictor.*``.
-  * Patch encoder (AR loopback) + real weights via ``patch_encoder.*``.
-  * Five projectors + real weights via their own top-level prefixes.
-  * CAM++ speaker encoder (3D-Speaker x-vector, voice cloning) + real
-    weights via ``speaker_encoder.safetensors``.
-  * Step 7a: preprocess() wired — per-step embedding + per-request state
-    (_RequestState, _pending_requests).
-  * Step 7b: state lifecycle (on_requests_finished + deferred cleanup).
-  * Step 7c: make_omni_output() wired (delta audio, side-channel drain).
-  * Step 7d: compute_logits() wired (continue/stop signal via _results_queue).
-  * Step 7e (skeleton): forward() drives base LM + per-req side-path
-    stub + cleanup.
-  * Step 7e-r1: _finish_decode now runs DiT N-step Euler → audio latent
-    patch [1, 4, 128]; FM buffer state lives in _RequestState.
-  * Step 7e-r2: patch_encoder AR loopback wired (one vLLM step = one
-    audio patch; patch_encoder collapses internal _PATCH_ENCODER_OUT_DS_RATE
-    positions into one LLM token).
-  * Step 7e-r3a: io_helper.denormalize wired between DiT (normalized
-    space) and patch_encoder / AudioVAE (raw space).  Stats loaded from
-    latent_stats.pt sitting alongside checkpoint files.
-  * Step 7e-r3b: AudioVAE.inference_from_latents wired — decode steps
-    push real wav chunks ([7680] @ 48 kHz = 160 ms each) to _audio_queue
-    instead of empty zeros.
-  * Step 7e-r3c: eos_proj real value wired into _results_queue; threshold
-    0.8 (upstream eos_threshold default) flips state.is_stopping.
-    compute_logits prefill_completed hard-stop fallback removed — stop
-    is now fully driven by real eos_proj.
-  * Review M2: AudioVAE streaming decode — per-request BigVGANStreamState
-    (LSTM hidden + sliding latent window) replaces per-patch isolated
-    inference_from_latents, so every patch gets real left conv context.
-    Prefill's patch #0 now reaches the vocoder too (upstream zero-shot
-    emits every DiT patch); stop path drains the 2-frame lookahead tail
-    via stream_flush.
+Mirrors upstream rednote-hilab/dots.tts (pinned @ a393d2e):
 
-Still stubbed for later steps: end-to-end forward chain (base LM → DiT →
-patch_encoder → AudioVAE → wav), runtime config, CUDA Graph caches,
-make_omni_output / compute_logits.  See dots_tts_notes.md §5.1 for the
-roadmap.
+  * Qwen2.5-1.5B base LM runs under vLLM PagedAttention (stock
+    ``Qwen2Model``); weights come from the checkpoint's ``llm.model.*``
+    namespace.  ``DotsTTSConfig`` hoists the LM fields to top-level
+    attributes.
+  * Everything else is side computation, invisible to the vLLM
+    scheduler and driven once per step by ``_finish_decode``:
+    DiT flow-matching head (N-step Euler, fp32 integration state,
+    deterministic per-request noise) → io_helper denormalize →
+    patch_encoder AR loopback (produces the next step's LLM input
+    embedding) + streaming AudioVAE decode (per-request
+    ``BigVGANStreamState`` sliding window, so every latent patch is
+    decoded with real left conv context) → 48 kHz wav chunks pushed to
+    ``_audio_queue`` → eos_proj stop signal via ``_results_queue``
+    (threshold 0.8, upstream default; the stop step also drains the
+    vocoder's 2-frame lookahead tail via ``stream_flush``).
+  * Cross-step state is isolated per request in ``_RequestState``
+    (keyed by request_id); eviction is deferred to the end of
+    ``forward()`` so a finishing request's audio still drains.
+  * The CAM++ speaker encoder is constructed and its weights load, but
+    voice cloning is not exposed yet — generation is zero-shot and the
+    DiT falls back to its null conditioning (``fm_null_g_cond``).
 
-Reference: vllm_omni/model_executor/models/ming_flash_omni/ming_flash_omni_talker.py
-(its ``_load_vae_weights`` is the model for our AudioVAE branch).
+Debugging: set ``DOTS_TTS_BETA_TRACE=1`` for an env-gated per-patch
+rms/max trace across the full side path (zero overhead when unset).
+
+Reference implementations: ``vllm_omni/model_executor/models/voxcpm2/``
+(architectural template: vLLM-native base LM + side path + per-request
+state) and ``ming_flash_omni`` (AudioVAE weight-loading pattern).
 """
 
 from __future__ import annotations
@@ -160,10 +143,9 @@ class _IOHelper:
         return x * torch.sqrt(var) + mean
 
 
-# Per-request state container for AR-loop continuity (see notes §3.3 / §0.5).
-# Step 7a opens with just the next-step embed slot — 7b/7e add fields for
-# stop logits, pending audio chunks, prefill masks, etc.
-# 逻辑 pipeline modelrunner（中的东西） 性能优化
+# Per-request state container for AR-loop continuity.  All cross-step
+# side-path state lives here, keyed by request_id, so concurrent requests
+# stay fully isolated (the voxcpm2 _RequestState pattern).
 @dataclass
 class _RequestState:
     request_id: str
@@ -174,8 +156,8 @@ class _RequestState:
     # VAESemanticEncoder._project_embeddings.)  _finish_decode writes a
     # fresh tensor every call.
     curr_embed_for_next: torch.Tensor | None = None
-    # Stop-signal cache (step 7d).  forward()'s _finish_decode (step 7e)
-    # populates precomputed_stop_logits; compute_logits drains it.
+    # Stop-signal cache: _finish_decode populates precomputed_stop_logits;
+    # compute_logits drains it.
     precomputed_stop_logits: torch.Tensor | None = None
     is_stopping: bool = False
     prefill_completed: bool = False
@@ -184,7 +166,7 @@ class _RequestState:
     # are reproducible run-to-run and concurrent requests cannot perturb
     # each other's noise streams (voxcpm2 _fill_deterministic_cfm_noise).
     noise_step: int = 0
-    # Step 7e-r1: per-request FM static workspace (lazy-allocated by
+    # Per-request FM static workspace (lazy-allocated by
     # _initialize_request_fm_state on first _finish_decode call).  Sized for
     # _MAX_AUDIO_PATCHES × (_HIDDEN_PATCH_SIZE + _LATENT_PATCH_SIZE) = 1024 × 5
     # = 5120 positions.
@@ -193,10 +175,11 @@ class _RequestState:
     fm_null_g_cond: torch.Tensor | None = None  # [1, _FM_HIDDEN]
     fm_seq_len: int = 0
     fm_capacity: int = 0
-    # Speaker x-vector after _xvec_proj.  V1 zero-shot: None → DiT call
-    # falls back to fm_null_g_cond.  Step 7e-r3+ wires real voice clone.
+    # Speaker x-vector after _xvec_proj.  Zero-shot generation leaves this
+    # None → DiT falls back to fm_null_g_cond; voice-clone wiring is a
+    # follow-up.
     g_cond: torch.Tensor | None = None
-    # Step 7e-r2: AR-loop bookkeeping.
+    # AR-loop bookkeeping.
     # patch_encoder_state holds conv_tail + per-layer KV caches for the
     # patch_encoder's streaming decode (mirrors upstream state.patch_encoder_state).
     # Lazy-allocated by _run_patch_encoder_loopback on first audio step.
@@ -283,7 +266,7 @@ def _build_soar_patch_encoder_config() -> _PatchEncoderConfig:
 
 
 class DotsTTSForConditionalGeneration(nn.Module):
-    """dots.tts AR talker.  Step 4c: base LM + AudioVAE + DiT head (real weights)."""
+    """dots.tts AR talker: Qwen2.5 base LM + DiT / AudioVAE / CAM++ side path."""
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
@@ -383,24 +366,6 @@ class DotsTTSForConditionalGeneration(nn.Module):
         self._audio_vae.float()
         self._speaker_encoder.float()
 
-        # === DOTS_TTS_FP32_SIDE patch (Phase 3 (C) experiment) ===
-        # Env-gated: lift the entire DiT + patch_encoder + projector
-        # side-path to fp32 to test whether the step 7+ cos drift
-        # (notes §17, ~0.1-0.6 vs 0.95+ early) is bf16 accumulation.
-        # LLM stays bf16 — only the side path runs fp32.  Production
-        # zero overhead when env var unset.  Cast at the LLM↔side
-        # boundary happens inside _finish_decode.
-        self._fp32_side = bool(os.environ.get("DOTS_TTS_FP32_SIDE"))
-        if self._fp32_side:
-            self._head.float()
-            self._patch_encoder.float()
-            self._hidden_proj.float()
-            self._latent_proj.float()
-            self._coordinate_proj.float()
-            self._xvec_proj.float()
-            self._eos_proj.float()
-        # === end patch ===
-
         # Latent stats — independent of safetensors (torch.load on
         # latent_stats.pt sitting next to the checkpoint files).  Used by
         # _finish_decode to bridge between DiT's normalized latent space and
@@ -417,47 +382,49 @@ class DotsTTSForConditionalGeneration(nn.Module):
             )
             self._io_helper = _IOHelper()
 
-        # (β) diagnostic: per-patch rms/max log, env-gated.  Remove once
-        # the first-N-patch wav burst is localized.
+        # (β) diagnostic: env-gated per-patch rms/max trace across the full
+        # side path (LLM hidden → DiT → denormalize → patch_encoder → wav →
+        # eos).  Zero overhead when DOTS_TTS_BETA_TRACE is unset (single
+        # bool check per step); kept as the model's debugging instrument
+        # (cf. voxcpm2's enable_profiling runtime knob).
         self._beta_trace = bool(os.environ.get("DOTS_TTS_BETA_TRACE"))
 
-        # Step 7a state plumbing — see notes §6.2.
+        # Per-request state plumbing.
         # _active_states: per-request state keyed by request_id (created in
-        #   preprocess prefill, cleared by _flush_deferred_cleanup in 7e).
+        #   preprocess prefill, evicted by _flush_deferred_cleanup).
         # _pending_requests: per-step list of (req_id, is_prefill, embeds,
-        #   span_len) populated by preprocess(), consumed by forward() in 7e.
+        #   span_len) populated by preprocess(), consumed by forward().
         # _deferred_cleanup_ids: requests vLLM has marked finished but whose
         #   side-path audio still needs draining in the current forward step;
-        #   evicted from _active_states at forward end (notes §8 3rd session).
+        #   evicted from _active_states at the end of forward().
         self._active_states: dict[str, _RequestState] = {}
         self._pending_requests: list[tuple[str, bool, torch.Tensor, int]] = []
         self._deferred_cleanup_ids: set[str] = set()
 
-        # Step 7c audio side-channel:
-        # _audio_queue: forward()'s _collect_audio (wired in 7e) pushes
-        #   (req_id, audio_tensor) tuples here; make_omni_output drains them
-        #   into multimodal_outputs each step.
+        # Audio side-channel:
+        # _audio_queue: _finish_decode pushes (req_id, audio_tensor) tuples
+        #   here; make_omni_output drains them into multimodal_outputs each
+        #   step.
         # _sample_rate: cached from AudioVAE config (= 48000 for soar).
         self._audio_queue: list[tuple[str, torch.Tensor]] = []
         self._sample_rate = self._audio_vae.sample_rate
 
-        # Step 7d stop-signal side-channel:
-        # _results_queue: forward()'s _finish_decode (wired in 7e) pushes
-        #   (req_id, stop_logits) tuples here; compute_logits drains them
-        #   into the [bsz, vocab_size] logits tensor each step.
+        # Stop-signal side-channel:
+        # _results_queue: _finish_decode pushes (req_id, stop_logits) tuples
+        #   here; compute_logits drains them into the [bsz, vocab_size]
+        #   logits tensor each step.
         self._results_queue: list[tuple[str, torch.Tensor | None]] = []
 
         logger.info(
-            "DotsTTS step-7e-r3c built (base_lm=Qwen2[28L,12H,1536d], "
+            "DotsTTS talker built (base_lm=Qwen2[28L,12H,1536d], "
             "audio_vae=AudioVAE, dit=DiT[18L,16H,1024d], "
             "patch_encoder=VAESemanticEncoder[24L,16H,1024d], "
             "5 projectors, speaker_encoder=CAM++[7.2M], "
-            "io_helper=%s, model=%s, fp32_side=%s, dit_steps=%d); vLLM dispatch chain wired end-to-end; "
+            "io_helper=%s, model=%s, dit_steps=%d); "
             "_finish_decode: DiT → denormalize → patch_encoder AR + "
-            "AudioVAE decode → wav + eos_proj → stop signal.",
+            "streaming AudioVAE decode → wav + eos_proj → stop signal.",
             "loaded" if self._io_helper.global_mean is not None else "identity",
             vllm_config.model_config.model,
-            self._fp32_side,
             _DIT_NUM_STEPS,
         )
 
@@ -469,12 +436,14 @@ class DotsTTSForConditionalGeneration(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> torch.Tensor | IntermediateTensors:
-        """Step 7e (skeleton): drive base LM + per-request side-path stub.
+        """Drive the base LM, then the per-request audio side path.
 
-        Drives the vLLM dispatch chain end-to-end (preprocess → forward →
-        compute_logits → make_omni_output → on_requests_finished), but
-        emits empty audio.  The real DiT sampling + AudioVAE decode + AR
-        loopback (`_finish_decode` body) lands in a follow-up.
+        One vLLM step: base LM forward under PagedAttention, then slice
+        the scaffold hidden states per request (in _pending_requests
+        order) and run _finish_decode on each — DiT sampling, streaming
+        AudioVAE decode, AR loopback, and stop signal all happen there.
+        vLLM only ever sees the returned hidden states; audio leaves
+        through the _audio_queue side channel.
         """
         output = self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
         if isinstance(output, IntermediateTensors):
@@ -496,7 +465,7 @@ class DotsTTSForConditionalGeneration(nn.Module):
 
         return output
 
-    # ── vllm-omni contract stubs (real impls land in step 3+) ──
+    # ── vllm-omni protocol methods ──
 
     @staticmethod
     def _resolve_latent_stats_path(model_arg: str) -> str | None:
@@ -539,19 +508,18 @@ class DotsTTSForConditionalGeneration(nn.Module):
         input_embeds: torch.Tensor | None = None,
         **info_dict: Any,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
-        """Step 7a: per-step embedding + state registration.
+        """Per-step embedding + per-request state registration.
 
-        Prefill (span_len > 1): embed the wrapped prompt
+        Prefill: embed the wrapped prompt
         ``[文本]<text>[文本对应语音]<AUDIO_GEN_START>`` via the LM's
         embed_tokens.  Caller (serving layer or test harness) is
         responsible for the wrap — talker just embeds whatever it gets.
 
         Decode (span_len == 1): use ``state.curr_embed_for_next`` from
-        the previous step's AR loopback (DiT → patch_encoder output).
-        Until step 7e closes the AR loop, decode falls back to a zero
-        embed.
+        the previous step's AR loopback (DiT → patch_encoder output);
+        zero fallback only if the loopback hasn't produced one yet.
 
-        Voice clone is intentionally not wired here — V1 zero-shot only.
+        Voice clone is intentionally not wired here — zero-shot only.
 
         Returns ``(input_ids unchanged, embeds [span_len, hidden_size],
         {})``.  ``forward()`` consumes ``self._pending_requests`` to
@@ -569,8 +537,8 @@ class DotsTTSForConditionalGeneration(nn.Module):
         dev = input_ids.device
         req_id = info_dict.get("request_id", "default")
         state = self._active_states.get(req_id)
-        # Step 7e-r2: prefill detected by state lifecycle (not span_len), so
-        # decode can use span_len=1 with a multi-position curr_embed_for_next.
+        # Prefill is detected by state lifecycle (not span_len), so decode
+        # can use span_len=1 with a multi-position curr_embed_for_next.
         is_prefill = state is None or not state.prefill_completed
 
         if is_prefill:
@@ -583,7 +551,7 @@ class DotsTTSForConditionalGeneration(nn.Module):
             state.is_stopping = False
             state.prefill_completed = False
             state.noise_step = 0
-            # 7e-r2: reset AR-loop state on every prefill.
+            # Reset AR-loop state on every prefill.
             state.patch_encoder_state = None
             state.vocoder_stream_state = None
             embeds = self.model.embed_tokens(input_ids)
@@ -613,8 +581,8 @@ class DotsTTSForConditionalGeneration(nn.Module):
         vLLM scheduler calls this BEFORE forward() to notify that certain
         requests have completed.  We can't drop their _RequestState yet —
         the current forward step still needs to drain side-path audio
-        chunks (notes §8 third session).  Real eviction happens at the
-        end of forward() via _flush_deferred_cleanup (wired in step 7e).
+        chunks.  Real eviction happens at the end of forward() via
+        _flush_deferred_cleanup.
         """
         for req_id in finished_req_ids:
             if req_id in self._active_states:
@@ -622,7 +590,7 @@ class DotsTTSForConditionalGeneration(nn.Module):
 
     def _flush_deferred_cleanup(self) -> None:
         """Evict states marked by on_requests_finished.  Called at the
-        tail of forward() (step 7e)."""
+        tail of forward()."""
         for req_id in self._deferred_cleanup_ids:
             self._active_states.pop(req_id, None)
         self._deferred_cleanup_ids.clear()
@@ -633,7 +601,7 @@ class DotsTTSForConditionalGeneration(nn.Module):
         req_hidden: torch.Tensor,
         is_prefill: bool,
     ) -> None:
-        """Step 7e-r2 — FM buffer + DiT N-step Euler + patch_encoder AR loopback.
+        """One request's per-step side path: DiT → AR loopback → wav → stop.
 
         One vLLM step = one audio patch.  patch_encoder.decode_patch
         collapses its internal _PATCH_ENCODER_OUT_DS_RATE positions into
@@ -653,20 +621,10 @@ class DotsTTSForConditionalGeneration(nn.Module):
           7. (decode only) eos_proj(last_hidden) → stop_logits pushed to
              _results_queue; threshold > 0.8 flips state.is_stopping and
              stream_flush drains the decoder's lookahead tail.
-
-        Verify covers prefill + N=10 decode (stop prob distribution + a
-        compute_logits drain) in /tmp/test_finish_decode_7e_r3c.py.
         """
         state = self._active_states.get(req_id)
         if state is None:
             return
-
-        # Phase 3 (C) boundary cast: lift LLM hidden to fp32 before any
-        # side-path computation, so fm_sequence buffers allocate fp32 on
-        # first call and the entire DiT + projector + patch_encoder chain
-        # stays fp32 end-to-end.  No-op when DOTS_TTS_FP32_SIDE unset.
-        if self._fp32_side:
-            req_hidden = req_hidden.float()
 
         if state.fm_sequence is None:
             self._initialize_request_fm_state(
@@ -677,23 +635,6 @@ class DotsTTSForConditionalGeneration(nn.Module):
 
         # 1. Append last LLM hidden to fm_sequence (+1 position).
         last_hidden = req_hidden[-_HIDDEN_PATCH_SIZE:].unsqueeze(0)
-
-        # === DOTS_TTS_HIDDEN_DUMP patch (vllm-omni regression diff) ===
-        _dump_dir = os.environ.get("DOTS_TTS_HIDDEN_DUMP")
-        if _dump_dir:
-            os.makedirs(_dump_dir, exist_ok=True)
-            _idx = getattr(self, "_dump_idx", 0)
-            torch.save(
-                {
-                    "hidden": last_hidden.detach().cpu().float(),
-                    "shape": list(last_hidden.shape),
-                    "dtype": str(last_hidden.dtype),
-                    "is_prefill": is_prefill,
-                },
-                f"{_dump_dir}/step_{_idx:04d}.pt",
-            )
-            self._dump_idx = _idx + 1
-        # === end patch ===
 
         self._append_hidden_chunk(state, last_hidden)
 
@@ -815,7 +756,7 @@ class DotsTTSForConditionalGeneration(nn.Module):
             f"{wav_part} | {stop_part}"
         )
 
-    # ── Step 7e-r1 helpers (per-request FM workspace + DiT N-step Euler) ──
+    # ── FM helpers (per-request workspace + DiT N-step Euler) ──
 
     def _initialize_request_fm_state(
         self,
@@ -827,8 +768,8 @@ class DotsTTSForConditionalGeneration(nn.Module):
         """Lazy-allocate per-request FM workspace.
 
         Mirrors upstream _allocate_generate_state (model.py:413) but per-
-        request (no workspace sharing) so per-request isolation
-        (SKILL I5 / notes §3.3) holds.
+        request (no workspace sharing) so concurrent requests stay
+        isolated.
         """
         fm_capacity = _MAX_AUDIO_PATCHES * (_HIDDEN_PATCH_SIZE + _LATENT_PATCH_SIZE)
         state.fm_capacity = fm_capacity
@@ -990,8 +931,8 @@ class DotsTTSForConditionalGeneration(nn.Module):
         latent_start = total_len - _LATENT_PATCH_SIZE
         # fp32 ODE integration (same fix as Ming's CFM sampler, PR #4341):
         # bf16's 7-bit mantissa loses the small per-step increments in the
-        # z += v*dt accumulation (hidden-state cos drift past step ~7,
-        # notes §17) and quantizes the linspace timesteps.  Integration
+        # z += v*dt accumulation (hidden-state cos drift vs upstream past
+        # step ~7) and quantizes the linspace timesteps.  Integration
         # state stays fp32; DiT matmuls still run bf16 under the autocast
         # block below, and the result is cast back to the sequence dtype
         # on return.
@@ -1206,9 +1147,9 @@ class DotsTTSForConditionalGeneration(nn.Module):
         Encodes continue/stop into ``logits[i, 0]`` / ``logits[i, 1]``
         (voxcpm2 convention — rest of vocab stays at -inf so the sampler
         picks between the two slots).  Source of stop logits is
-        ``self._results_queue``, populated by forward()'s _finish_decode
-        in step 7e-r3c.  When the queue is empty (preprocess-only steps),
-        defaults to all-continue.
+        ``self._results_queue``, populated by forward()'s _finish_decode.
+        When the queue is empty (preprocess-only steps), defaults to
+        all-continue.
         """
         if isinstance(hidden_states, OmniOutput):
             hidden_states = hidden_states.text_hidden_states
@@ -1233,17 +1174,17 @@ class DotsTTSForConditionalGeneration(nn.Module):
                         logits[i, 0] = 0.0
                         logits[i, 1] = 1.0
                     else:
-                        # is_stopping=False 等价于 prob_stop ≤ 0.8 — 强制
-                        # continue. 不能直接喂 raw softmax (continue, stop) 当
-                        # logits, 否则 greedy sampler 直接比大小, 实际有效阈值
-                        # 降到 0.5, 模型早停拽不住, 表现为多余尾音 / 后半段退化.
+                        # is_stopping=False means prob_stop <= 0.8 — force
+                        # continue.  Feeding the raw softmax (continue, stop)
+                        # pair as logits would let the greedy sampler compare
+                        # them directly, silently lowering the effective stop
+                        # threshold to 0.5 (early stop, swallowed endings).
                         logits[i, 0] = 1.0
                     if state is not None:
                         state.precomputed_stop_logits = None
                 else:
-                    # No stop signal pushed this step (prefill, or pre-
-                    # 7e-r3c skeleton path).  Default to continue — stop
-                    # is now driven by real eos_proj, no hard-stop fallback.
+                    # No stop signal pushed this step (prefill placeholder).
+                    # Default to continue — stop is driven by eos_proj.
                     logits[i, 0] = 1.0  # continue
             self._results_queue.clear()
         else:
@@ -1355,7 +1296,7 @@ class DotsTTSForConditionalGeneration(nn.Module):
             loaded_vae = vae_loader.load_weights(iter(matched_vae))
             loaded.update(f"_audio_vae.{name}" for name in loaded_vae)
             logger.info(
-                "DotsTTS step-7e-r3c: loaded %d/%d AudioVAE tensors.",
+                "DotsTTS load_weights: loaded %d/%d AudioVAE tensors.",
                 len(loaded_vae),
                 len(vae_state_keys),
             )
@@ -1365,7 +1306,7 @@ class DotsTTSForConditionalGeneration(nn.Module):
             loaded_dit = dit_loader.load_weights(iter(matched_dit))
             loaded.update(f"_head.{name}" for name in loaded_dit)
             logger.info(
-                "DotsTTS step-7e-r3c: loaded %d/%d DiT tensors.",
+                "DotsTTS load_weights: loaded %d/%d DiT tensors.",
                 len(loaded_dit),
                 len(dit_state_keys),
             )
@@ -1375,7 +1316,7 @@ class DotsTTSForConditionalGeneration(nn.Module):
             loaded_patch = patch_loader.load_weights(iter(matched_patch))
             loaded.update(f"_patch_encoder.{name}" for name in loaded_patch)
             logger.info(
-                "DotsTTS step-7e-r3c: loaded %d/%d patch_encoder tensors.",
+                "DotsTTS load_weights: loaded %d/%d patch_encoder tensors.",
                 len(loaded_patch),
                 len(patch_state_keys),
             )
@@ -1390,7 +1331,7 @@ class DotsTTSForConditionalGeneration(nn.Module):
             loaded_proj = proj_loader.load_weights(iter(matched))
             loaded.update(f"{attr_name}.{name}" for name in loaded_proj)
             logger.info(
-                "DotsTTS step-7e-r3c: loaded %d/%d %s tensors.",
+                "DotsTTS load_weights: loaded %d/%d %s tensors.",
                 len(loaded_proj),
                 len(projector_state_keys[prefix]),
                 prefix[:-1],
@@ -1404,7 +1345,7 @@ class DotsTTSForConditionalGeneration(nn.Module):
             loaded_llm = self.model.load_weights(iter(matched_llm))
             loaded.update(f"model.{name}" for name in loaded_llm)
             logger.info(
-                "DotsTTS step-7e-r3c: loaded %d Qwen2 tensors (fed %d; %d llm.lm_head.* skipped — tied embeddings).",
+                "DotsTTS load_weights: loaded %d Qwen2 tensors (fed %d; %d llm.lm_head.* skipped — tied embeddings).",
                 len(loaded_llm),
                 len(matched_llm),
                 skipped_lm_head,
@@ -1415,7 +1356,7 @@ class DotsTTSForConditionalGeneration(nn.Module):
             loaded_speaker = speaker_loader.load_weights(iter(matched_speaker))
             loaded.update(f"_speaker_encoder.{name}" for name in loaded_speaker)
             logger.info(
-                "DotsTTS step-7e-r3c: loaded %d/%d CAM++ speaker_encoder tensors.",
+                "DotsTTS load_weights: loaded %d/%d CAM++ speaker_encoder tensors.",
                 len(loaded_speaker),
                 len(speaker_state_keys),
             )
@@ -1429,7 +1370,7 @@ class DotsTTSForConditionalGeneration(nn.Module):
             and not matched_speaker
         ):
             logger.warning(
-                "DotsTTS step-7e-r3c load_weights: no AudioVAE / DiT / "
+                "DotsTTS load_weights: no AudioVAE / DiT / "
                 "patch_encoder / projector / Qwen2 / speaker_encoder keys matched."
             )
 
