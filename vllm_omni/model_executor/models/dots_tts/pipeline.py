@@ -21,6 +21,7 @@ from vllm_omni.config.stage_config import (
 DOTS_TTS_PIPELINE = PipelineConfig(
     model_type="dots_tts",
     model_arch="DotsTTSForConditionalGeneration",
+    default_deploy_config_name="dots_tts.yaml",
     stages=(
         StagePipelineConfig(
             stage_id=0,
