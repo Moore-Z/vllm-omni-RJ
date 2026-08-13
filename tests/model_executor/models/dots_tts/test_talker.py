@@ -15,6 +15,9 @@ from types import SimpleNamespace
 
 import pytest
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
 torch = pytest.importorskip("torch")
 
 _VOCAB_SIZE = 151672
