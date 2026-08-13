@@ -96,7 +96,7 @@ _FM_HIDDEN = 1024  # DiT.hidden_size  (also LLM↔DiT projection target)
 _LATENT_DIM = 128  # AudioVAE.latent_dim
 _LATENT_PATCH_SIZE = 4  # config.patch_size — DiT samples 4 latent frames / audio patch
 _HIDDEN_PATCH_SIZE = 1  # upstream core.py hardcodes self.hidden_patch_size = 1
-_MAX_AUDIO_PATCHES = 1024  # ~85 s @ 4×1920/48k; bounds per-request FM static buffer
+_MAX_AUDIO_PATCHES = 1024  # ~164 s @ 4×1920/48k; bounds per-request FM static buffer
 _DIT_NUM_STEPS = int(
     os.environ.get("DOTS_TTS_DIT_NUM_STEPS", "10")
 )  # env-gated; upstream default 10 for fixed-step Euler
@@ -666,6 +666,21 @@ class DotsTTSForConditionalGeneration(nn.Module):
                 dtype=req_hidden.dtype,
             )
 
+        # This step's append would overflow the per-request FM buffer.
+        # Stop gracefully (same path as a model-decided stop below) instead
+        # of raising past _append_hidden_chunk/_append_history_chunk —
+        # those raises are engine-fatal, not request-fatal, and would take
+        # every other in-flight and future request down with this one.
+        if state.fm_seq_len + _HIDDEN_PATCH_SIZE + _LATENT_PATCH_SIZE > state.fm_capacity:
+            state.is_stopping = True
+            stop_logits = torch.tensor([[0.0, 1.0]], device=req_hidden.device, dtype=req_hidden.dtype)
+            state.precomputed_stop_logits = stop_logits
+            tail = self._audio_vae.stream_flush(state.vocoder_stream_state)
+            if tail.size(-1) > 0:
+                self._audio_queue.append((req_id, tail.reshape(-1)))
+            self._results_queue.append((req_id, stop_logits))
+            return
+
         # 1. Append last LLM hidden to fm_sequence (+1 position).
         last_hidden = req_hidden[-_HIDDEN_PATCH_SIZE:].unsqueeze(0)
 
@@ -1028,12 +1043,13 @@ class DotsTTSForConditionalGeneration(nn.Module):
         state: _RequestState,
         audio_patch_raw: torch.Tensor,
     ) -> torch.Tensor:
-        """Decode one audio latent patch → _PATCH_ENCODER_OUT_DS_RATE LLM input embeds.
+        """Decode one audio latent patch → 1 LLM input embed.
 
         Mirrors upstream _consume_audio_patch (model.py:1557) — patch_encoder
         side only.  Lazy-allocates state.patch_encoder_state on first call.
-        Returns ``llm_embedding`` of shape ``[1, _PATCH_ENCODER_OUT_DS_RATE,
-        llm_hidden]``.
+        Returns ``llm_embedding`` of shape ``[1, 1, llm_hidden]`` — the
+        _PATCH_ENCODER_OUT_DS_RATE encoder positions fold into the feature
+        axis before ``out_proj``, not into separate output positions.
 
         ``audio_patch_raw`` must already be denormalized (raw VAE latent
         space).  Caller (_finish_decode) runs io_helper.denormalize on
